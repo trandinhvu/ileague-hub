@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>iLeague Hub</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;600;700;800&display=swap');
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'Be Vietnam Pro', sans-serif; background: #0a0e1a; color: #e0e0e0; min-height: 100vh; padding: 16px; }
+        h1 { color: #42a5f5; font-size: 20px; }
+        .subtitle { color: #666; font-size: 12px; margin-bottom: 16px; }
+        .status-bar { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; padding: 10px 14px; background: rgba(255,255,255,0.04); border-radius: 10px; font-size: 12px; flex-wrap: wrap; }
+        .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+        .dot.on { background: #4caf50; animation: pulse 1.5s infinite; }
+        .dot.off { background: #f44336; }
+        @keyframes pulse { 0%,100%{opacity:1}50%{opacity:0.3} }
+        .btn { padding: 6px 14px; border: none; border-radius: 6px; font-family: inherit; font-size: 12px; font-weight: 600; cursor: pointer; }
+        .btn-blue { background: #1e88e5; color: #fff; }
+        .btn-green { background: #2e7d32; color: #fff; }
+        .btn-red { background: #c62828; color: #fff; }
+        .btn-sm { padding: 4px 10px; font-size: 11px; }
+        input { font-family: inherit; font-size: 12px; padding: 5px 8px; border-radius: 5px; border: 1px solid #333; background: #1a1a2e; color: #e0e0e0; }
+        .tournament-bar { display: flex; gap: 8px; align-items: center; margin-bottom: 14px; padding: 10px 14px; background: rgba(255,255,255,0.04); border-radius: 10px; flex-wrap: wrap; }
+        .tournament-bar input { flex: 1; min-width: 200px; }
+        .board-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; margin-top: 12px; }
+        .board-card { background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 14px; overflow: hidden; }
+        .board-header { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; background: rgba(255,255,255,0.03); }
+        .board-ip { font-size: 12px; color: #64b5f6; font-weight: 600; }
+        .board-game { font-size: 10px; color: #999; }
+        .board-status { font-size: 9px; font-weight: 700; padding: 2px 8px; border-radius: 10px; text-transform: uppercase; }
+        .board-status.live { background: rgba(76,175,80,0.2); color: #66bb6a; animation: pulse 1.5s infinite; }
+        .board-status.end { background: rgba(255,82,82,0.2); color: #ff5252; }
+        .board-status.no_game { background: rgba(255,255,255,0.08); color: #666; }
+        .board-scores { display: flex; align-items: center; justify-content: center; padding: 16px 12px; gap: 8px; }
+        .board-player { flex: 1; text-align: center; }
+        .board-player-name { font-size: 11px; color: #999; margin-bottom: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .board-player-score { font-size: 36px; font-weight: 800; }
+        .board-player-score.high { color: #4caf50; }
+        .board-player-score.low { color: #f44336; }
+        .board-player-score.draw { color: #ffd54f; }
+        .board-vs { font-size: 14px; color: #333; font-weight: 700; }
+        .board-stats { display: flex; justify-content: center; gap: 16px; padding: 6px 12px; font-size: 10px; color: #666; border-top: 1px solid rgba(255,255,255,0.04); }
+        .board-stat { text-align: center; }
+        .board-stat-val { font-weight: 700; color: #90caf9; font-size: 12px; }
+        .board-mapping { padding: 10px 14px; border-top: 1px solid rgba(255,255,255,0.06); }
+        .board-mapped { font-size: 11px; color: #66bb6a; display: flex; justify-content: space-between; align-items: center; }
+        .map-form { display: flex; gap: 4px; }
+        .map-form input { flex: 1; min-width: 80px; }
+        .board-updated { text-align: center; font-size: 9px; color: #444; padding: 4px; }
+        .empty { text-align: center; padding: 60px 20px; color: #444; }
+        .empty .icon { font-size: 48px; margin-bottom: 12px; }
+        .log-section { margin-top: 20px; }
+        .log-title { font-size: 13px; font-weight: 700; color: #90caf9; margin-bottom: 6px; }
+        .log-list { max-height: 150px; overflow-y: auto; font-size: 10px; }
+        .log-item { padding: 3px 0; border-bottom: 1px solid rgba(255,255,255,0.03); display: flex; gap: 8px; }
+        .log-time { color: #444; min-width: 60px; }
+    </style>
+</head>
+<body>
+    <h1>iLeague Hub</h1>
+    <p class="subtitle">Tự động quét bảng điểm Hello trong WiFi → đọc điểm real-time</p>
+
+    <div class="status-bar">
+        <div class="dot" id="dot"></div>
+        <span id="statusText">Khởi động...</span>
+        <span style="color:#333">|</span>
+        <span>Bảng điểm: <b id="devCount">0</b></span>
+        <span>Mapped: <b id="mapCount">0</b></span>
+        <span style="margin-left:auto"><button class="btn btn-blue btn-sm" onclick="doScan()">🔍 Quét WiFi</button></span>
+    </div>
+
+    <div class="tournament-bar" id="tournamentBar">
+        <input type="text" id="tidInput" placeholder="Tournament ID (dán từ URL giải đấu)">
+        <button class="btn btn-blue" onclick="loadTournament()">Load giải</button>
+        <span id="tournamentName" style="color:#66bb6a;font-size:12px;font-weight:600"></span>
+    </div>
+
+    <div class="board-grid" id="grid"></div>
+
+    <div class="log-section">
+        <div class="log-title">Log thay đổi điểm</div>
+        <div class="log-list" id="logs"></div>
+    </div>
+
+    <script>
+        const API = 'http://localhost:5050/api';
+        const ILEAGUE_API = 'https://ileague.info/api.php';
+        let _tournamentId = '';
+        let _tournamentMatches = [];
+        let _tournamentName = '';
+
+        async function loadTournament() {
+            let tid = document.getElementById('tidInput').value.trim();
+            // Extract ID from URL if pasted
+            if (tid.includes('id=')) tid = tid.split('id=')[1].split('&')[0];
+            if (!tid) return alert('Nhập Tournament ID hoặc dán URL giải đấu');
+
+            try {
+                const r = await fetch(ILEAGUE_API + '?action=hub_matches&id=' + tid);
+                const data = await r.json();
+                if (data.error) return alert('Không tìm thấy giải: ' + data.error);
+                _tournamentId = data.id;
+                _tournamentName = data.name;
+                _tournamentMatches = data.matches || [];
+                document.getElementById('tournamentName').textContent = '✅ ' + _tournamentName + ' (' + _tournamentMatches.length + ' trận)';
+                load(); // Re-render grid with dropdowns
+            } catch(e) {
+                alert('Lỗi kết nối server');
+            }
+        }
+
+        async function doScan() {
+            document.getElementById('statusText').textContent = 'Đang quét WiFi...';
+            try {
+                await fetch(API + '/scan', { method: 'POST' });
+                load();
+            } catch(e) {}
+        }
+
+        async function load() {
+            try {
+                const [sr, dr, lr] = await Promise.all([
+                    fetch(API + '/status'), fetch(API + '/devices'), fetch(API + '/scores')
+                ]);
+                const status = await sr.json();
+                const devices = await dr.json();
+                const logs = await lr.json();
+
+                document.getElementById('dot').className = 'dot ' + (status.running ? 'on' : 'off');
+                document.getElementById('statusText').textContent = status.running ? 'Đang chạy' : 'Dừng';
+                document.getElementById('devCount').textContent = status.devices_found;
+                document.getElementById('mapCount').textContent = status.devices_mapped;
+
+                renderGrid(devices);
+                renderLogs(logs);
+            } catch(e) {
+                document.getElementById('dot').className = 'dot off';
+                document.getElementById('statusText').textContent = 'Không kết nối Agent';
+            }
+        }
+
+        function renderGrid(devices) {
+            const grid = document.getElementById('grid');
+            if (!devices.length) {
+                grid.innerHTML = '<div class="empty"><div class="icon">📡</div>Chưa tìm thấy bảng điểm.<br>Bấm "Quét WiFi" để tìm.</div>';
+                return;
+            }
+            grid.innerHTML = devices.map((d, i) => {
+                const s = d.last_score || {};
+                const s1 = s.score1 ?? '-';
+                const s2 = s.score2 ?? '-';
+                const s1c = s1 > s2 ? 'high' : s1 < s2 ? 'low' : s1 === s2 && s1 !== '-' ? 'draw' : '';
+                const s2c = s2 > s1 ? 'high' : s2 < s1 ? 'low' : s1 === s2 && s2 !== '-' ? 'draw' : '';
+                const statusCls = s.is_end ? 'end' : s.score1 !== undefined ? 'live' : 'no_game';
+                const statusText = s.is_end ? 'End' : s.score1 !== undefined ? 'Live' : 'Chờ';
+                const m = d.mapping;
+                const safeIp = d.ip.replace(/\./g, '_');
+                const updated = d.last_update ? d.last_update.split('T')[1]?.substring(0,8) : '';
+
+                return `
+                <div class="board-card">
+                    <div class="board-header">
+                        <div>
+                            <div class="board-ip">Bàn ${i+1} · ${d.ip}</div>
+                            <div class="board-game">${s.game_type || ''}</div>
+                        </div>
+                        <span class="board-status ${statusCls}">${statusText}</span>
+                    </div>
+                    <div class="board-scores">
+                        <div class="board-player">
+                            <div class="board-player-name">${s.player1_name || 'VĐV 1'}</div>
+                            <div class="board-player-score ${s1c}">${s1}</div>
+                        </div>
+                        <div class="board-vs">-</div>
+                        <div class="board-player">
+                            <div class="board-player-name">${s.player2_name || 'VĐV 2'}</div>
+                            <div class="board-player-score ${s2c}">${s2}</div>
+                        </div>
+                    </div>
+                    <div class="board-stats">
+                        <div class="board-stat">Turns<br><span class="board-stat-val">${s.turns1 ?? '-'} / ${s.turns2 ?? '-'}</span></div>
+                        <div class="board-stat">Avg<br><span class="board-stat-val">${s.avg1 ?? '-'} / ${s.avg2 ?? '-'}</span></div>
+                        <div class="board-stat">HR<br><span class="board-stat-val">${s.high_run1 ?? '-'} / ${s.high_run2 ?? '-'}</span></div>
+                    </div>
+                    <div class="board-mapping">
+                        ${m ? `
+                            <div class="board-mapped">
+                                <span>✅ ${m.match_code}</span>
+                                <button class="btn btn-red btn-sm" onclick="unmap('${d.ip}')">Bỏ</button>
+                            </div>
+                        ` : _tournamentMatches.length ? `
+                            <select style="width:100%;font-size:11px;padding:5px;background:#1a1a2e;color:#e0e0e0;border:1px solid #333;border-radius:5px" onchange="quickMap('${d.ip}', this.value)">
+                                <option value="">— Chọn trận đấu —</option>
+                                ${_tournamentMatches.filter(m => m.status !== 'end').map(m => {
+                                    const scoreText = (m.score1 !== null && m.score2 !== null) ? ' [' + m.score1 + '-' + m.score2 + ']' : '';
+                                    const statusIcon = m.status === 'live' ? '🔴 ' : '';
+                                    return '<option value="' + m.code + '">' + statusIcon + m.label + ': ' + m.player1 + ' vs ' + m.player2 + scoreText + '</option>';
+                                }).join('')}
+                            </select>
+                        ` : `
+                            <div style="font-size:10px;color:#666">Load giải đấu ở trên để map trận</div>
+                        `}
+                    </div>
+                    ${updated ? '<div class="board-updated">⏱ ' + updated + '</div>' : ''}
+                </div>`;
+            }).join('');
+        }
+
+        function renderLogs(logs) {
+            document.getElementById('logs').innerHTML = logs.slice(-20).reverse().map(l =>
+                `<div class="log-item">
+                    <span class="log-time">${l.timestamp?.split('T')[1]?.substring(0,8)||''}</span>
+                    <span>${l.ip}</span>
+                    <span style="font-weight:700">${l.scores}</span>
+                    <span style="color:${l.pushed?'#66bb6a':l.mapped?'#ef5350':'#666'}">${l.pushed?'✅ pushed':l.mapped?'❌ failed':'—'}</span>
+                </div>`
+            ).join('');
+        }
+
+        async function quickMap(ip, matchCode) {
+            if (!matchCode) return;
+            if (!_tournamentId) return alert('Load giải đấu trước');
+            await fetch(API + '/map', {
+                method: 'POST',
+                headers: {'Content-Type':'application/json'},
+                body: JSON.stringify({ ip, tournament_id: _tournamentId, match_code: matchCode })
+            });
+            load();
+        }
+
+        async function unmap(ip) {
+            await fetch(API + '/unmap', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ip}) });
+            load();
+        }
+
+        setInterval(load, 3000);
+        load();
+    </script>
+</body>
+</html>

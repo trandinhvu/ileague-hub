@@ -1,0 +1,7 @@
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+ileague_hub_config.json
+hub_agent_v2_backup.py

@@ -1,0 +1,76 @@
+name: Build iLeague Hub
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build Windows exe
+        run: |
+          pyinstaller --name iLeagueHub --onefile --noconsole --add-data "static;static" --hidden-import pystray --hidden-import PIL --hidden-import PIL.ImageDraw --hidden-import PIL.Image hub_agent.py
+
+      - name: Create ZIP
+        run: |
+          cd dist
+          Compress-Archive -Path iLeagueHub.exe -DestinationPath iLeagueHub-win.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iLeagueHub-win
+          path: dist/iLeagueHub-win.zip
+
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build Mac app
+        run: |
+          pyinstaller --name iLeagueHub --onefile --noconsole --add-data "static:static" --hidden-import pystray --hidden-import PIL --hidden-import PIL.ImageDraw --hidden-import PIL.Image hub_agent.py
+
+      - name: Create ZIP
+        run: |
+          cd dist && zip -r iLeagueHub-mac.zip iLeagueHub.app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iLeagueHub-mac
+          path: dist/iLeagueHub-mac.zip
+
+  release:
+    needs: [build-windows, build-mac]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            iLeagueHub-win/iLeagueHub-win.zip
+            iLeagueHub-mac/iLeagueHub-mac.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
