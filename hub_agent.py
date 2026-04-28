@@ -449,8 +449,8 @@ def setup_page():
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;600;700;800&display=swap');
 *{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:'Be Vietnam Pro',sans-serif;background:#0a0e1a;color:#e0e0e0;min-height:100vh;display:flex;align-items:center;justify-content:center}}
-.setup-box{{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.12);border-radius:16px;padding:32px;max-width:420px;width:90%;text-align:center}}
+body{{font-family:'Be Vietnam Pro',sans-serif;background:#0a0e1a;color:#e0e0e0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}}
+.setup-box{{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.12);border-radius:16px;padding:32px;max-width:440px;width:100%;text-align:center}}
 h1{{color:#42a5f5;font-size:22px;margin-bottom:4px}}
 .sub{{color:#666;font-size:12px;margin-bottom:24px}}
 label{{display:block;font-size:12px;color:#90caf9;margin:16px 0 6px;font-weight:600;text-align:left}}
@@ -458,21 +458,30 @@ input{{width:100%;padding:10px 12px;border-radius:8px;border:1px solid #333;back
 input:focus{{outline:2px solid #42a5f5;border-color:transparent}}
 .btn{{display:block;width:100%;padding:12px;border:none;border-radius:8px;background:#1e88e5;color:#fff;font-size:14px;font-weight:700;cursor:pointer;margin-top:20px;font-family:inherit}}
 .btn:hover{{background:#1565c0}}
+.btn-secondary{{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.15)}}
+.btn-secondary:hover{{background:rgba(255,255,255,0.1)}}
 .btn:disabled{{background:#333;cursor:not-allowed}}
 .note{{font-size:10px;color:#555;margin-top:12px}}
 .version{{font-size:10px;color:#333;margin-top:8px}}
 .google-wrap{{display:flex;justify-content:center;margin:16px 0}}
+.divider{{display:flex;align-items:center;gap:10px;margin:16px 0;color:#444;font-size:11px}}
+.divider::before,.divider::after{{content:'';flex:1;height:1px;background:rgba(255,255,255,0.08)}}
 .user-info{{background:rgba(76,175,80,0.15);border:1px solid rgba(76,175,80,0.3);border-radius:8px;padding:10px 14px;margin:12px 0;text-align:left;font-size:13px;display:none}}
 .user-info .name{{color:#66bb6a;font-weight:700}}
 .user-info .email{{color:#90caf9;font-size:12px}}
+.toggle-link{{color:#64b5f6;font-size:12px;cursor:pointer;text-decoration:underline;display:inline-block;margin-top:14px}}
+.toggle-link:hover{{color:#90caf9}}
 #step2{{display:none}}
+#manualForm{{display:none}}
 </style></head><body>
 <div class="setup-box">
 <h1>iLeague Hub</h1>
 <p class="sub">Cài đặt lần đầu — kết nối bảng điểm với iLeague</p>
 
 <div id="step1">
-<p style="color:#90caf9;font-size:13px;margin-bottom:12px;font-weight:600">Bước 1: Đăng nhập Google</p>
+<p style="color:#90caf9;font-size:13px;margin-bottom:12px;font-weight:600">Bước 1: Đăng nhập</p>
+
+<div id="googleForm">
 <div class="google-wrap">
 <div id="g_id_onload"
      data-client_id="{client_id}"
@@ -486,6 +495,16 @@ input:focus{{outline:2px solid #42a5f5;border-color:transparent}}
      data-text="signin_with"
      data-shape="rectangular">
 </div>
+</div>
+<a class="toggle-link" onclick="toggleManual(true)">Hoặc nhập Gmail thủ công →</a>
+</div>
+
+<div id="manualForm">
+<label>Gmail của bạn</label>
+<input id="manualEmail" type="email" placeholder="VD: chubida@gmail.com" required>
+<p style="font-size:10px;color:#999;margin-top:6px;text-align:left">Phải là Gmail đã/sẽ dùng để login iLeague trên web</p>
+<button class="btn btn-secondary" onclick="useManualEmail()">Tiếp tục</button>
+<a class="toggle-link" onclick="toggleManual(false)">← Đăng nhập bằng Google</a>
 </div>
 </div>
 
@@ -501,7 +520,7 @@ input:focus{{outline:2px solid #42a5f5;border-color:transparent}}
 <button class="btn" id="startBtn" onclick="doSetup()">Bắt đầu quét bảng điểm</button>
 </div>
 
-<p class="note">Đăng nhập Google để liên kết bảng điểm tại CLB với tài khoản iLeague</p>
+<p class="note">Liên kết bảng điểm tại CLB với tài khoản iLeague</p>
 <p class="version">iLeague Hub v{VERSION}</p>
 </div>
 
@@ -509,15 +528,30 @@ input:focus{{outline:2px solid #42a5f5;border-color:transparent}}
 var _email = '';
 var _name = '';
 
+function toggleManual(show) {{
+    document.getElementById('googleForm').style.display = show ? 'none' : 'block';
+    document.getElementById('manualForm').style.display = show ? 'block' : 'none';
+}}
+
 function onGoogleSignIn(response) {{
-    // Decode JWT to get email
     var parts = response.credential.split('.');
     var payload = JSON.parse(atob(parts[1].replace(/-/g,'+').replace(/_/g,'/')));
     _email = payload.email || '';
     _name = payload.name || '';
+    showStep2(_email, _name);
+}}
 
-    document.getElementById('userName').textContent = _name;
-    document.getElementById('userEmail').textContent = _email;
+function useManualEmail() {{
+    var email = document.getElementById('manualEmail').value.trim().toLowerCase();
+    if (!email || email.indexOf('@') === -1) {{ alert('Nhập đúng định dạng email'); return; }}
+    _email = email;
+    _name = email.split('@')[0];
+    showStep2(_email, _name);
+}}
+
+function showStep2(email, name) {{
+    document.getElementById('userName').textContent = name;
+    document.getElementById('userEmail').textContent = email;
     document.getElementById('userInfo').style.display = 'block';
     document.getElementById('step1').style.display = 'none';
     document.getElementById('step2').style.display = 'block';
@@ -526,7 +560,7 @@ function onGoogleSignIn(response) {{
 function doSetup() {{
     var club = document.getElementById('clubName').value.trim();
     if (!club) {{ alert('Nhập tên CLB'); return; }}
-    if (!_email) {{ alert('Đăng nhập Google trước'); return; }}
+    if (!_email) {{ alert('Đăng nhập / nhập email trước'); return; }}
 
     fetch('/api/setup', {{
         method: 'POST',
