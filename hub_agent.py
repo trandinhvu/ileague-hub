@@ -86,6 +86,14 @@ agent_status = {
     'version': VERSION,
     'errors': []
 }
+pro_status = {
+    'active': None,   # None = not checked, True/False after check
+    'in_grace': False,
+    'plan': None,
+    'days_left': 0,
+    'expires_at': None,
+    'last_check': None
+}
 
 # ============================================================
 # NETWORK UTILS
@@ -571,8 +579,49 @@ def api_status():
         'email': config.get('email', ''),
         'auto_start': config.get('auto_start', False),
         'version': VERSION,
-        'recent_errors': agent_status['errors'][-5:]
+        'recent_errors': agent_status['errors'][-5:],
+        'pro': {
+            'active': pro_status['active'],
+            'in_grace': pro_status['in_grace'],
+            'plan': pro_status['plan'],
+            'days_left': pro_status['days_left'],
+            'expires_at': pro_status['expires_at']
+        }
     })
+
+
+@app.route('/api/pro_status')
+def api_pro_status():
+    """Return cached Pro license status."""
+    return jsonify(pro_status)
+
+
+def fetch_pro_status():
+    """Query ileague.info to refresh Pro license status. Cache in pro_status global."""
+    email = config.get('email', '').strip().lower()
+    if not email:
+        return
+    try:
+        url = config.get('ileague_api', 'https://ileague.info/api.php')
+        r = requests.get(url, params={'action': 'check_pro', 'email': email}, timeout=8)
+        if r.status_code != 200:
+            return
+        d = r.json()
+        pro_status['active'] = bool(d.get('active'))
+        pro_status['in_grace'] = bool(d.get('in_grace'))
+        pro_status['plan'] = d.get('plan')
+        pro_status['days_left'] = d.get('days_left', 0)
+        pro_status['expires_at'] = d.get('expires_at')
+        pro_status['last_check'] = datetime.now().isoformat()
+    except Exception as e:
+        agent_status['errors'].append(f'Pro check error: {e}')
+
+
+def pro_status_loop():
+    """Background: refresh Pro status every 5 minutes."""
+    while True:
+        fetch_pro_status()
+        time.sleep(300)
 
 
 @app.route('/api/config', methods=['GET', 'POST'])
@@ -705,10 +754,28 @@ def run_tray():
         current = config.get('auto_start', False)
         set_autostart(not current)
 
+    def open_pro_page(icon, item):
+        webbrowser.open('https://ileague.info/h')
+
+    def pro_label():
+        if pro_status['active'] is None:
+            return '⏳ Pro: kiểm tra...'
+        if pro_status['active'] and not pro_status['in_grace']:
+            plan = (pro_status['plan'] or '').upper()
+            return f"⭐ Pro {plan} · còn {pro_status['days_left']}d"
+        if pro_status['in_grace']:
+            return '⏰ Pro hết hạn — gia hạn'
+        return '🔒 Free · Click để nâng cấp Pro'
+
+    def pro_clickable():
+        # Click to open upgrade page when not active; disabled when active.
+        return not (pro_status['active'] and not pro_status['in_grace'])
+
     club = config.get('club_name', 'iLeague Hub')
     menu = pystray.Menu(
         pystray.MenuItem(f'iLeague Hub v{VERSION}', None, enabled=False),
         pystray.MenuItem(f'CLB: {club}', None, enabled=False),
+        pystray.MenuItem(lambda item: pro_label(), open_pro_page, enabled=lambda item: pro_clickable()),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem('Mở Dashboard', open_dashboard, default=True),
         pystray.MenuItem('Cập nhật Status', show_status),
@@ -723,6 +790,19 @@ def run_tray():
     )
 
     icon = pystray.Icon('ileague_hub', create_icon(), f'iLeague Hub — {club}', menu)
+
+    # Tooltip refresher: keeps Pro days_left visible in tray hover
+    def refresh_tooltip_loop():
+        while True:
+            try:
+                active = len(get_active_devices())
+                tip = f'iLeague Hub — {club}\n{active} bảng điểm active\n{pro_label()}'
+                icon.title = tip
+            except Exception:
+                pass
+            time.sleep(60)
+
+    threading.Thread(target=refresh_tooltip_loop, daemon=True).start()
     icon.run()
 
 
@@ -744,6 +824,11 @@ def main():
     scan_thread = threading.Thread(target=scan_loop, daemon=True)
     scan_thread.start()
     print('🔍 Scanning network for scoreboards...')
+
+    # Start Pro status refresh loop (every 5 min). First check is immediate so
+    # the tray/dashboard show the right state on first hover.
+    fetch_pro_status()
+    threading.Thread(target=pro_status_loop, daemon=True).start()
 
     # Start system tray in background thread
     tray_thread = threading.Thread(target=run_tray, daemon=True)

@@ -67,6 +67,7 @@
         <span style="color:#333">|</span>
         <span>Bảng điểm: <b id="devCount">0</b></span>
         <span>Mapped: <b id="mapCount">0</b></span>
+        <a id="proBadge" href="https://ileague.info/h" target="_blank" style="display:none;text-decoration:none;padding:3px 9px;border-radius:12px;font-size:11px;font-weight:700;cursor:pointer"></a>
         <span style="margin-left:auto"><button class="btn btn-blue btn-sm" onclick="doScan()">🔍 Quét WiFi</button></span>
     </div>
 
@@ -110,6 +111,33 @@
             }
         }
 
+        function renderProBadge(pro) {
+            var el = document.getElementById('proBadge');
+            if (!el || !pro) return;
+            el.style.display = 'inline-block';
+            if (pro.active === null) {
+                el.textContent = '⏳ Pro: …';
+                el.style.background = 'rgba(255,255,255,0.06)';
+                el.style.color = '#777';
+                el.title = 'Đang kiểm tra license...';
+            } else if (pro.active && !pro.in_grace) {
+                el.textContent = '⭐ Pro · ' + pro.days_left + 'd';
+                el.style.background = 'linear-gradient(135deg,#fbc02d,#f57c00)';
+                el.style.color = '#1a0a00';
+                el.title = 'iLeague Pro · hết hạn ' + (pro.expires_at || '').split('T')[0];
+            } else if (pro.in_grace) {
+                el.textContent = '⏰ Gia hạn Pro';
+                el.style.background = 'linear-gradient(135deg,#ff7043,#d84315)';
+                el.style.color = '#fff';
+                el.title = 'Pro vừa hết hạn — gia hạn ngay';
+            } else {
+                el.textContent = '🔒 Free · Nâng cấp Pro';
+                el.style.background = 'rgba(255,82,82,0.15)';
+                el.style.color = '#ef9a9a';
+                el.title = 'Cần Pro để auto-sync bảng điểm. Click để đăng ký.';
+            }
+        }
+
         async function doScan() {
             document.getElementById('statusText').textContent = 'Đang quét WiFi...';
             try {
@@ -132,6 +160,7 @@
                 document.getElementById('devCount').textContent = status.devices_found;
                 document.getElementById('mapCount').textContent = status.devices_mapped;
 
+                renderProBadge(status.pro);
                 renderGrid(devices);
                 renderLogs(logs);
             } catch(e) {
