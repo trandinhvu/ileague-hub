@@ -19,9 +19,19 @@ jobs:
         run: |
           pip install -r requirements.txt pyinstaller
 
+      - name: Download ffmpeg (Windows static build)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-extract
+          $exe = Get-ChildItem -Path "ffmpeg-extract" -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+          Copy-Item $exe.FullName -Destination "ffmpeg.exe"
+          Get-Item ffmpeg.exe | Select-Object Length, FullName
+          .\ffmpeg.exe -version | Select-Object -First 1
+
       - name: Build Windows exe
         run: |
-          pyinstaller --name iLeagueHub --onefile --noconsole --add-data "static;static" --hidden-import pystray --hidden-import pystray._win32 --hidden-import PIL --hidden-import PIL.ImageDraw --hidden-import PIL.Image --hidden-import PIL.ImageFont --hidden-import flask_cors hub_agent.py
+          pyinstaller --name iLeagueHub --onefile --noconsole --add-data "static;static" --add-binary "ffmpeg.exe;." --hidden-import pystray --hidden-import pystray._win32 --hidden-import PIL --hidden-import PIL.ImageDraw --hidden-import PIL.Image --hidden-import PIL.ImageFont --hidden-import flask_cors hub_agent.py
 
       - name: Create ZIP
         run: |
@@ -46,9 +56,17 @@ jobs:
         run: |
           pip install -r requirements.txt pyinstaller
 
+      - name: Download ffmpeg (macOS static build)
+        run: |
+          curl -L -o ffmpeg.zip https://evermeet.cx/ffmpeg/getrelease/zip
+          unzip -o ffmpeg.zip
+          chmod +x ffmpeg
+          ls -lh ffmpeg
+          ./ffmpeg -version | head -1
+
       - name: Build Mac app
         run: |
-          pyinstaller --name iLeagueHub --onefile --noconsole --add-data "static:static" --hidden-import pystray --hidden-import pystray._darwin --hidden-import PIL --hidden-import PIL.ImageDraw --hidden-import PIL.Image --hidden-import PIL.ImageFont --hidden-import flask_cors hub_agent.py
+          pyinstaller --name iLeagueHub --onefile --noconsole --add-data "static:static" --add-binary "ffmpeg:." --hidden-import pystray --hidden-import pystray._darwin --hidden-import PIL --hidden-import PIL.ImageDraw --hidden-import PIL.Image --hidden-import PIL.ImageFont --hidden-import flask_cors hub_agent.py
 
       - name: Create ZIP
         run: |

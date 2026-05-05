@@ -715,11 +715,24 @@ FONT_PATH = _find_font_path()
 
 
 def _ffmpeg_binary():
-    """Resolve ffmpeg binary. Bundled location takes priority for PyInstaller builds."""
-    bundled = BASE_DIR / ('ffmpeg.exe' if platform.system() == 'Windows' else 'ffmpeg')
+    """Resolve ffmpeg binary in 3 ordered locations:
+    1. PyInstaller --onefile extract dir (sys._MEIPASS) — set when bundled via --add-binary
+    2. BASE_DIR (next to the executable) — for users dropping ffmpeg manually
+    3. PATH — system-installed ffmpeg
+    """
+    name = 'ffmpeg.exe' if platform.system() == 'Windows' else 'ffmpeg'
+    # 1. Check PyInstaller bundle extract dir
+    meipass = getattr(sys, '_MEIPASS', None)
+    if meipass:
+        cand = Path(meipass) / name
+        if cand.exists():
+            return str(cand)
+    # 2. Check next to executable
+    bundled = BASE_DIR / name
     if bundled.exists():
         return str(bundled)
-    return 'ffmpeg'  # rely on $PATH
+    # 3. Fallback to PATH
+    return 'ffmpeg'
 
 
 def _build_ffmpeg_cmd(rtsp_url, static_png, score_txt, yt_stream_key, banner_png=None):
