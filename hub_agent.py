@@ -21,8 +21,10 @@ import threading
 import time
 import json
 import os
+import re
 import sys
 import subprocess
+import unicodedata
 import webbrowser
 import platform
 from datetime import datetime, timedelta
@@ -55,7 +57,9 @@ def load_config():
         'scoreboard_port': 8080,
         'active_threshold_hours': 2,
         'auto_start': False,
-        'setup_done': False
+        'setup_done': False,
+        'active_tournament_id': None,
+        'auto_map_enabled': True
     }
     if CONFIG_FILE.exists():
         try:
@@ -93,6 +97,17 @@ pro_status = {
     'days_left': 0,
     'expires_at': None,
     'last_check': None
+}
+
+# Active tournament for auto-mapping. Restored from config on startup.
+active_tournament_id = config.get('active_tournament_id')
+
+# Cache of hub_matches response per active tournament. Refreshed every 30s.
+tournament_matches_cache = {
+    'tid': None,
+    'matches': [],
+    'fetched_at': None,
+    'tournament_name': ''
 }
 
 # ============================================================
@@ -238,6 +253,21 @@ def push_devices_to_server():
         pass
 
 
+def _compute_status(scores):
+    """Decide match status from scoreboard reading.
+    - end: game finished (isEnd=true)
+    - next: not finished but no points scored yet (0-0) → trận chưa bắt đầu thực sự
+    - live: actively being played
+    """
+    if scores.get('is_end'):
+        return 'end'
+    s1 = scores.get('score1') or 0
+    s2 = scores.get('score2') or 0
+    if s1 == 0 and s2 == 0:
+        return 'next'
+    return 'live'
+
+
 def push_score_to_ileague(mapping, scores):
     """Push score update to iLeague server for a mapped match."""
     if not mapping or not scores:
@@ -249,9 +279,15 @@ def push_score_to_ileague(mapping, scores):
             'player1_score': scores.get('score1', 0),
             'player2_score': scores.get('score2', 0),
             'innings': scores.get('turns1', 0) + scores.get('turns2', 0),
-            'status': 'end' if scores.get('is_end') else 'live',
+            'status': _compute_status(scores),
             'email': config.get('email', '')
         }
+        # Group matches need indexes for backend to update the right slot
+        if 'group_idx' in mapping and 'match_idx' in mapping:
+            payload['group_idx'] = mapping['group_idx']
+            payload['match_idx'] = mapping['match_idx']
+        if 'cell_id' in mapping:
+            payload['cell_id'] = mapping['cell_id']
         resp = requests.post(
             f'{config["ileague_api"]}?action=score_update',
             json=payload, timeout=5
@@ -260,6 +296,715 @@ def push_score_to_ileague(mapping, scores):
         return result.get('updated', False)
     except:
         return False
+
+
+# ============================================================
+# AUTO-MAP BY PLAYER NAMES
+# ============================================================
+
+def _normalize_name(s):
+    """Normalize Vietnamese player name for fuzzy comparison.
+    Lowercase, strip diacritics, fold đ→d, collapse whitespace.
+    NFD chỉ tách combining marks (Mn). Chữ Đ/đ là codepoint đơn nên fold tay.
+    """
+    if not s:
+        return ''
+    s = str(s).lower().replace('đ', 'd')
+    s = unicodedata.normalize('NFD', s)
+    s = ''.join(c for c in s if unicodedata.category(c) != 'Mn')
+    return ' '.join(s.split())
+
+
+def _fetch_tournament_matches(tid, force=False):
+    """Fetch list of matches in a tournament from ileague.info. Cache 30s."""
+    if not tid:
+        return []
+    cache = tournament_matches_cache
+    now = time.time()
+    if (not force
+            and cache['tid'] == tid
+            and cache['fetched_at']
+            and (now - cache['fetched_at']) < 30):
+        return cache['matches']
+    try:
+        url = config.get('ileague_api', 'https://ileague.info/api.php')
+        r = requests.get(url, params={'action': 'hub_matches', 'id': tid}, timeout=8)
+        if r.status_code != 200:
+            return cache.get('matches', [])
+        d = r.json()
+        cache['tid'] = tid
+        cache['matches'] = d.get('matches', []) or []
+        cache['tournament_name'] = d.get('name', '')
+        cache['fetched_at'] = now
+        return cache['matches']
+    except Exception as e:
+        agent_status['errors'].append(f'Fetch matches error: {e}')
+        return cache.get('matches', [])
+
+
+def auto_map_by_names(ip, scores):
+    """Try to map a scoreboard IP to a match by fuzzy player-name pair.
+
+    - Skip if no active tournament set or auto-map disabled.
+    - Skip if IP already manually mapped (mapping without 'auto' flag).
+    - Re-map if existing auto-mapping no longer matches the names.
+
+    Returns True if a mapping was created/updated, False otherwise.
+    """
+    if not config.get('auto_map_enabled', True):
+        return False
+    if not active_tournament_id or not scores:
+        return False
+
+    p1_norm = _normalize_name(scores.get('player1_name'))
+    p2_norm = _normalize_name(scores.get('player2_name'))
+    if not p1_norm or not p2_norm:
+        return False
+
+    existing = mappings.get(ip)
+    if existing and not existing.get('auto'):
+        # Manual mapping — never override
+        return False
+
+    matches = _fetch_tournament_matches(active_tournament_id)
+    if not matches:
+        return False
+
+    candidates = []
+    for m in matches:
+        m1 = _normalize_name(m.get('player1'))
+        m2 = _normalize_name(m.get('player2'))
+        if not m1 or not m2:
+            continue
+        if (p1_norm == m1 and p2_norm == m2) or (p1_norm == m2 and p2_norm == m1):
+            candidates.append(m)
+
+    if not candidates:
+        return False
+
+    # Prefer matches still in play — skip already-finished trận
+    pending = [m for m in candidates if m.get('status') not in ('done', 'end')]
+    chosen = pending[0] if pending else candidates[0]
+    new_code = chosen.get('code')
+
+    # Already correctly auto-mapped → no-op
+    if existing and existing.get('match_code') == new_code:
+        return False
+
+    mapping = {
+        'tournament_id': active_tournament_id,
+        'match_code': new_code,
+        'auto': True,
+        'mapped_at': datetime.now().isoformat(),
+        'players': f"{chosen.get('player1')} vs {chosen.get('player2')}",
+        'label': chosen.get('label', new_code)
+    }
+    if chosen.get('type') == 'group':
+        mapping['group_idx'] = chosen.get('group_idx')
+        mapping['match_idx'] = chosen.get('match_idx')
+    elif chosen.get('type') == 'bracket':
+        mapping['cell_id'] = chosen.get('cell_id')
+
+    mappings[ip] = mapping
+    print(f'🔗 Auto-mapped {ip} → {mapping["label"]} ({mapping["players"]})')
+    return True
+
+
+# ============================================================
+# CAMERA RTSP DISCOVERY
+# ============================================================
+# Mỗi scoreboard Hello/9Score/Arena chạy HTTP server :8080 và đã được set
+# RTSP camera trong app config. Thử probe nhiều paths để tìm RTSP URL — cache
+# kết quả per-IP trong cameras.json. User có thể override manual.
+
+CAMERAS_FILE = BASE_DIR / 'cameras.json'
+
+# {ip: {rtsp_url, discovered, source, last_probe, probe_log[]}}
+cameras_db = {}
+
+# Common config paths to probe on scoreboard HTTP servers. The 3 partner apps
+# are closed-source — list grows as we reverse-engineer in real CLBs. Each path
+# is fetched and the response body searched for an rtsp:// substring.
+RTSP_PROBE_PATHS = [
+    '/',  # root listing
+    '/settings.json', '/config.json', '/app_config.json',
+    '/Settings/config.json', '/Config/settings.json',
+    '/Settings/', '/Config/',
+    '/app/settings.json', '/app/config.json',
+    '/preferences.json', '/prefs.xml', '/shared_prefs.xml',
+    '/camera.json', '/rtsp.txt', '/stream.txt', '/stream.json',
+    '/info.json', '/device.json', '/device_info.json'
+]
+
+RTSP_RE = re.compile(r'rtsp://[^\s"\'<>\\\)]+', re.IGNORECASE)
+
+
+def load_cameras():
+    global cameras_db
+    if CAMERAS_FILE.exists():
+        try:
+            with open(CAMERAS_FILE, 'r') as f:
+                cameras_db = json.load(f)
+        except Exception:
+            cameras_db = {}
+
+
+def save_cameras():
+    try:
+        with open(CAMERAS_FILE, 'w') as f:
+            json.dump(cameras_db, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        agent_status['errors'].append(f'Save cameras error: {e}')
+
+
+def discover_rtsp_for_scoreboard(ip, port=None):
+    """Probe a scoreboard HTTP server for RTSP camera URL.
+    Returns (rtsp_url, probe_log). rtsp_url is None if not found.
+    """
+    port = port or config.get('scoreboard_port', 8080)
+    log = []
+    for path in RTSP_PROBE_PATHS:
+        url = f'http://{ip}:{port}{path}'
+        try:
+            r = requests.get(url, timeout=2)
+            if r.status_code != 200:
+                log.append({'path': path, 'status': r.status_code, 'found': False})
+                continue
+            body = r.text
+            m = RTSP_RE.search(body)
+            if m:
+                rtsp = m.group(0).rstrip('.,;')
+                log.append({'path': path, 'status': 200, 'found': True, 'rtsp': rtsp})
+                return rtsp, log
+            log.append({'path': path, 'status': 200, 'found': False, 'size': len(body)})
+        except Exception as e:
+            log.append({'path': path, 'status': 'err', 'found': False, 'err': str(e)[:80]})
+    return None, log
+
+
+def ensure_camera_for(ip, force_reprobe=False):
+    """Ensure cameras_db has an entry for IP. Probe if missing or forced.
+    Returns the dict entry.
+    """
+    cam = cameras_db.get(ip)
+    if cam and not force_reprobe and cam.get('rtsp_url') and cam.get('source') == 'manual':
+        # Manual entry — never auto-overwrite
+        return cam
+    if cam and not force_reprobe and cam.get('rtsp_url') and cam.get('source') == 'discovered':
+        # Already discovered — skip unless re-probe requested
+        return cam
+
+    rtsp, log = discover_rtsp_for_scoreboard(ip)
+    cam = cameras_db.get(ip) or {}
+    cam['ip'] = ip
+    cam['last_probe'] = datetime.now().isoformat()
+    cam['probe_log'] = log[-20:]  # keep last 20 attempts
+    if rtsp:
+        # Don't override manual with discovered
+        if cam.get('source') != 'manual':
+            cam['rtsp_url'] = rtsp
+            cam['source'] = 'discovered'
+            cam['discovered'] = True
+    cameras_db[ip] = cam
+    save_cameras()
+    return cam
+
+
+def set_camera_manual(ip, rtsp_url):
+    """Set a manual RTSP URL for a scoreboard IP. Persists immediately."""
+    cam = cameras_db.get(ip) or {'ip': ip}
+    cam['rtsp_url'] = (rtsp_url or '').strip() or None
+    cam['source'] = 'manual' if cam['rtsp_url'] else 'cleared'
+    cam['set_at'] = datetime.now().isoformat()
+    cameras_db[ip] = cam
+    save_cameras()
+    return cam
+
+
+# ============================================================
+# OVERLAY RENDERING (Pillow)
+# ============================================================
+# Render PNG overlays per-match composited by ffmpeg over RTSP camera feed.
+# Two overlay layers per stream:
+#   1. static.png  — generated once at go-live: lower-third with player names,
+#                    club/tournament logo, sponsor banner strip
+#   2. score.txt   — atomically rewritten every 2s with live "5 - 3"; ffmpeg
+#                    drawtext reload=1 picks up changes without restart
+#
+# Banner crawl animation handled at ffmpeg level (overlay x= expression).
+
+OVERLAY_DIR = BASE_DIR / 'overlays'
+OVERLAY_DIR.mkdir(exist_ok=True)
+
+
+def _font(size, bold=False):
+    """Best-effort font loader. Falls back to PIL default."""
+    try:
+        from PIL import ImageFont
+        # Try common Vietnamese-friendly fonts
+        for path in [
+            '/System/Library/Fonts/Supplemental/Arial Unicode.ttf',  # mac
+            '/Library/Fonts/Arial Unicode.ttf',
+            'C:/Windows/Fonts/arial.ttf',
+            'C:/Windows/Fonts/arialbd.ttf',
+            '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+            '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+        ]:
+            if os.path.exists(path):
+                if bold and 'bold' not in path.lower() and 'bd' not in path.lower():
+                    continue
+                return ImageFont.truetype(path, size)
+        return ImageFont.load_default()
+    except Exception:
+        return None
+
+
+def render_overlay_static(cell_id, mapping, scores, live_config, output_path=None):
+    """Render the static overlay PNG (lower-third + logo + sponsor strip).
+    Returns Path to the PNG.
+    """
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        agent_status['errors'].append('Pillow not installed — cannot render overlay')
+        return None
+
+    W, H = 1280, 720
+    img = Image.new('RGBA', (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+
+    p1 = (scores or {}).get('player1_name', 'VĐV 1')
+    p2 = (scores or {}).get('player2_name', 'VĐV 2')
+    tournament = (live_config or {}).get('tournament_name', '')
+    club = (live_config or {}).get('club_name', config.get('club_name', ''))
+
+    # Lower-third banner: bottom 80px, gradient blue
+    LT_H = 80
+    for y in range(H - LT_H, H):
+        alpha = int(220 * (y - (H - LT_H)) / LT_H + 35)
+        d.line([(0, y), (W, y)], fill=(13, 35, 71, min(255, alpha)))
+
+    # Player names (left and right of lower-third)
+    f_name = _font(34, bold=True)
+    f_sub = _font(18)
+    if f_name:
+        d.text((24, H - LT_H + 14), p1, font=f_name, fill=(255, 255, 255, 255))
+        # right-aligned p2: rough estimate of text width
+        try:
+            w2 = d.textlength(p2, font=f_name)
+        except Exception:
+            w2 = len(p2) * 20
+        d.text((W - 24 - w2, H - LT_H + 14), p2, font=f_name, fill=(255, 255, 255, 255))
+
+    # Tournament + club at top center
+    if tournament:
+        f_top = _font(22, bold=True)
+        try:
+            wt = d.textlength(tournament, font=f_top) if f_top else len(tournament) * 14
+        except Exception:
+            wt = len(tournament) * 14
+        # Top bar
+        d.rectangle([(0, 0), (W, 50)], fill=(13, 35, 71, 200))
+        d.text(((W - wt) // 2, 12), tournament, font=f_top or _font(18), fill=(255, 215, 64, 255))
+
+    if club:
+        d.text((24, 60), club, font=f_sub, fill=(180, 200, 230, 220))
+
+    # Score plate placeholder — drawtext from ffmpeg fills here, but we draw a
+    # dark backing box so the live text reads cleanly even on bright video.
+    BOX_W, BOX_H = 220, 70
+    bx, by = (W - BOX_W) // 2, 12
+    d.rectangle([(bx, by), (bx + BOX_W, by + BOX_H)], fill=(0, 0, 0, 180), outline=(255, 215, 64, 255), width=2)
+
+    # "VS" hint inside the box; the live "5 - 3" lays on top via ffmpeg drawtext
+    f_vs = _font(14)
+    if f_vs:
+        d.text((bx + BOX_W // 2 - 8, by + BOX_H - 18), 'LIVE', font=f_vs, fill=(255, 82, 82, 255))
+
+    out = Path(output_path) if output_path else (OVERLAY_DIR / f'static_{cell_id}.png')
+    img.save(out, 'PNG')
+    return out
+
+
+def render_banner_strip(banners, output_path=None):
+    """Render a wide horizontal banner image used for sponsor crawl."""
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        return None
+
+    if not banners:
+        return None
+
+    H = 50
+    pad = 60
+    f = _font(22, bold=True)
+    # Compute total width
+    total_w = pad
+    for b in banners:
+        try:
+            w = (50 if not f else int(round(ImageDraw.Draw(Image.new('RGBA', (1, 1))).textlength(str(b), font=f)))) + pad
+        except Exception:
+            w = len(str(b)) * 14 + pad
+        total_w += w
+    img = Image.new('RGBA', (max(total_w, 1280), H), (13, 35, 71, 200))
+    d = ImageDraw.Draw(img)
+    x = pad
+    for b in banners:
+        d.text((x, 12), str(b), font=f or _font(16), fill=(255, 215, 64, 255))
+        try:
+            w = int(round(d.textlength(str(b), font=f))) if f else len(str(b)) * 14
+        except Exception:
+            w = len(str(b)) * 14
+        x += w + pad
+
+    out = Path(output_path) if output_path else (OVERLAY_DIR / 'banner_strip.png')
+    img.save(out, 'PNG')
+    return out
+
+
+def write_score_file(cell_id, scores):
+    """Atomically write '5 - 3' to score_{cell_id}.txt for ffmpeg drawtext reload."""
+    s1 = scores.get('score1') if scores else 0
+    s2 = scores.get('score2') if scores else 0
+    text = f'{s1 if s1 is not None else 0} - {s2 if s2 is not None else 0}'
+    path = OVERLAY_DIR / f'score_{cell_id}.txt'
+    tmp = path.with_suffix('.txt.tmp')
+    try:
+        tmp.write_text(text, encoding='utf-8')
+        os.replace(tmp, path)  # atomic on POSIX/Windows
+    except Exception as e:
+        agent_status['errors'].append(f'write_score {cell_id}: {e}')
+    return path
+
+
+# ============================================================
+# LIVE STREAM ORCHESTRATOR (ffmpeg → YouTube RTMP)
+# ============================================================
+# Per-IP state: a single ffmpeg subprocess that pulls RTSP from the camera
+# associated with that scoreboard, composites the static overlay PNG, draws
+# live score text, and pushes RTMP to YouTube.
+#
+# The watchdog thread restarts crashed subprocesses up to MAX_RESTARTS.
+# The score writer thread refreshes score_{cell_id}.txt every 2s so drawtext
+# reload=1 picks up new scores without restarting ffmpeg.
+
+MAX_RESTARTS = 5
+RESTART_BACKOFF_SEC = 4
+SCORE_WRITE_INTERVAL_SEC = 2
+
+# {ip: {mapping, rtsp_url, yt_stream_key, proc, started_at, status, restart_count, cell_id, last_error, ffmpeg_log}}
+live_streams = {}
+live_lock = threading.Lock()
+
+
+def _find_font_path():
+    """Locate a TTF file ffmpeg drawtext can use. Returns path or None."""
+    for path in [
+        '/System/Library/Fonts/Supplemental/Arial Unicode.ttf',
+        '/Library/Fonts/Arial Unicode.ttf',
+        'C:/Windows/Fonts/arial.ttf',
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+    ]:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+FONT_PATH = _find_font_path()
+
+
+def _ffmpeg_binary():
+    """Resolve ffmpeg binary. Bundled location takes priority for PyInstaller builds."""
+    bundled = BASE_DIR / ('ffmpeg.exe' if platform.system() == 'Windows' else 'ffmpeg')
+    if bundled.exists():
+        return str(bundled)
+    return 'ffmpeg'  # rely on $PATH
+
+
+def _build_ffmpeg_cmd(rtsp_url, static_png, score_txt, yt_stream_key, banner_png=None):
+    """Compose the ffmpeg command line for one stream.
+
+    - Camera audio is replaced by anullsrc (silence) — YouTube requires audio
+      track but most bida cameras don't carry meaningful audio.
+    - drawtext reload=1 re-reads the score file each frame for live updates.
+    - Banner crawl uses overlay x= expression for horizontal scroll.
+    """
+    target = f'rtmp://a.rtmp.youtube.com/live2/{yt_stream_key}'
+
+    # Inputs: 0=camera, 1=silence audio, 2=static overlay PNG, [3=banner]
+    cmd = [
+        _ffmpeg_binary(),
+        '-hide_banner', '-loglevel', 'warning',
+        '-rtsp_transport', 'tcp', '-stimeout', '5000000',
+        '-i', rtsp_url,
+        '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+        '-loop', '1', '-framerate', '5', '-i', str(static_png),
+    ]
+
+    # Build filter chain
+    fc = '[0:v]scale=1280:720,fps=30[v0];' \
+         '[v0][2:v]overlay=0:0:shortest=0[v1]'
+    if banner_png and os.path.exists(banner_png):
+        cmd += ['-loop', '1', '-framerate', '5', '-i', str(banner_png)]
+        # Scroll right→left at 80px/sec, anchored to bottom edge above the lower-third
+        fc += ";[v1][3:v]overlay=x='W-mod(t*80\\,W+w)':y=H-130[v2]"
+        last_v = '[v2]'
+    else:
+        last_v = '[v1]'
+
+    # Live score drawtext — fontfile is optional but helps on Windows
+    font_arg = f"fontfile='{FONT_PATH}':" if FONT_PATH else ''
+    fc += (f";{last_v}drawtext=textfile='{score_txt}':reload=1:"
+           f"{font_arg}fontsize=56:fontcolor=white:"
+           f"x=(w-text_w)/2:y=22:box=0[vout]")
+
+    cmd += [
+        '-filter_complex', fc,
+        '-map', '[vout]', '-map', '1:a',
+        '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
+        '-b:v', '4500k', '-maxrate', '5000k', '-bufsize', '9000k',
+        '-pix_fmt', 'yuv420p', '-g', '60', '-keyint_min', '60',
+        '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
+        '-f', 'flv', target,
+    ]
+    return cmd
+
+
+def _post_live_state(action, mapping, youtube_url=''):
+    """Notify ileague.info that a stream went live or stopped, so the scoreboard
+    online viewer's YouTube icon links to the right URL.
+    """
+    if not mapping:
+        return
+    try:
+        url = config.get('ileague_api', 'https://ileague.info/api.php')
+        body = {
+            'tournament_id': mapping.get('tournament_id'),
+            'match_code': mapping.get('match_code'),
+            'youtube_url': youtube_url,
+            'email': config.get('email', '')
+        }
+        requests.post(f'{url}?action={action}', json=body, timeout=5)
+    except Exception as e:
+        agent_status['errors'].append(f'{action} push error: {e}')
+
+
+def _yt_url_from_key(yt_key):
+    """Best-effort viewer URL. Without YouTube API we can't resolve the watch URL,
+    so we publish the channel's /live convenience URL only when a video URL was
+    supplied externally. For now return an empty placeholder; UI shows youtube.com/live2 hint.
+    """
+    # Real watch URL requires YouTube Data API — out of scope. UI will show
+    # whatever url ileague_admin pasted. For now, leave empty.
+    return ''
+
+
+def start_stream(ip):
+    """Start an ffmpeg push stream for the scoreboard at IP.
+    Requires: cameras_db[ip].rtsp_url, mappings[ip], live_config.yt_stream_key.
+    Returns dict { ok, error?, stream }.
+    """
+    with live_lock:
+        if ip in live_streams and live_streams[ip].get('proc'):
+            proc = live_streams[ip]['proc']
+            if proc.poll() is None:
+                return {'ok': False, 'error': 'already_running', 'stream': live_streams[ip]}
+
+        cam = cameras_db.get(ip) or {}
+        rtsp = cam.get('rtsp_url')
+        if not rtsp:
+            return {'ok': False, 'error': 'no_rtsp_for_ip'}
+
+        mapping = mappings.get(ip)
+        if not mapping:
+            return {'ok': False, 'error': 'no_mapping_for_ip'}
+
+        # Fetch live config for the tournament (gives us yt_stream_key + assets)
+        try:
+            url = config.get('ileague_api', 'https://ileague.info/api.php')
+            r = requests.get(url, params={'action': 'live_config', 'id': mapping['tournament_id']}, timeout=8)
+            if r.status_code == 402:
+                return {'ok': False, 'error': 'pro_required', 'detail': r.json()}
+            if r.status_code != 200:
+                return {'ok': False, 'error': f'live_config http {r.status_code}'}
+            live_cfg = r.json()
+        except Exception as e:
+            return {'ok': False, 'error': f'live_config fetch: {e}'}
+
+        yt_key = live_cfg.get('yt_stream_key', '').strip()
+        if not yt_key:
+            return {'ok': False, 'error': 'no_yt_stream_key', 'detail': 'Cấu hình YouTube stream key cho giải đấu trước'}
+
+        cell_id = mapping.get('match_code', ip).replace('/', '_').replace(' ', '_')
+        scores = (devices.get(ip) or {}).get('last_score') or {}
+
+        # Render overlays
+        static_png = render_overlay_static(cell_id, mapping, scores, live_cfg)
+        banner_png = render_banner_strip(live_cfg.get('overlay_banners') or [])
+        score_txt = write_score_file(cell_id, scores)
+
+        if not static_png:
+            return {'ok': False, 'error': 'overlay_render_failed (Pillow installed?)'}
+
+        cmd = _build_ffmpeg_cmd(rtsp, static_png, score_txt, yt_key, banner_png)
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                start_new_session=(platform.system() != 'Windows')
+            )
+        except FileNotFoundError:
+            return {'ok': False, 'error': 'ffmpeg_not_found',
+                    'detail': 'Cài ffmpeg và đảm bảo có trên PATH (hoặc bundle vào thư mục agent)'}
+        except Exception as e:
+            return {'ok': False, 'error': f'ffmpeg spawn: {e}'}
+
+        stream_state = {
+            'ip': ip,
+            'cell_id': cell_id,
+            'mapping': dict(mapping),
+            'rtsp_url': rtsp,
+            'yt_stream_key': yt_key,
+            'tournament_id': mapping.get('tournament_id'),
+            'match_code': mapping.get('match_code'),
+            'proc': proc,
+            'started_at': datetime.now().isoformat(),
+            'status': 'starting',
+            'restart_count': 0,
+            'last_error': None,
+            'ffmpeg_log': []  # last N stderr lines
+        }
+        live_streams[ip] = stream_state
+
+    # Notify ileague.info to set YouTube link on the scoreboard online
+    _post_live_state('live_started', mapping, _yt_url_from_key(yt_key))
+
+    return {'ok': True, 'stream': _stream_dict_safe(stream_state)}
+
+
+def stop_stream(ip, post_to_server=True):
+    """Stop a running stream cleanly."""
+    with live_lock:
+        st = live_streams.get(ip)
+        if not st:
+            return {'ok': False, 'error': 'not_running'}
+        proc = st.get('proc')
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                try: proc.kill()
+                except Exception: pass
+        st['status'] = 'stopped'
+        st['stopped_at'] = datetime.now().isoformat()
+        mapping = st.get('mapping')
+        del live_streams[ip]
+
+    if post_to_server and mapping:
+        _post_live_state('live_stopped', mapping, '')
+    return {'ok': True}
+
+
+def _stream_dict_safe(st):
+    """Strip non-serializable fields (Popen) for JSON output."""
+    if not st:
+        return None
+    proc = st.get('proc')
+    return {
+        'ip': st['ip'],
+        'cell_id': st.get('cell_id'),
+        'tournament_id': st.get('tournament_id'),
+        'match_code': st.get('match_code'),
+        'rtsp_url': st.get('rtsp_url'),
+        'started_at': st.get('started_at'),
+        'status': 'running' if (proc and proc.poll() is None) else st.get('status', 'dead'),
+        'restart_count': st.get('restart_count', 0),
+        'last_error': st.get('last_error'),
+        'pid': proc.pid if proc else None,
+        'ffmpeg_log_tail': (st.get('ffmpeg_log') or [])[-5:]
+    }
+
+
+def watchdog_loop():
+    """Restart crashed ffmpeg processes; refresh score files every 2s."""
+    last_score_write = 0
+    while True:
+        try:
+            now = time.time()
+            with live_lock:
+                ips = list(live_streams.keys())
+
+            # Update score files for all live streams every SCORE_WRITE_INTERVAL_SEC
+            if now - last_score_write >= SCORE_WRITE_INTERVAL_SEC:
+                last_score_write = now
+                for ip in ips:
+                    st = live_streams.get(ip)
+                    if not st:
+                        continue
+                    scores = (devices.get(ip) or {}).get('last_score') or {}
+                    write_score_file(st['cell_id'], scores)
+
+            # Watchdog: restart died streams
+            for ip in ips:
+                st = live_streams.get(ip)
+                if not st:
+                    continue
+                proc = st.get('proc')
+                if proc is None:
+                    continue
+                ret = proc.poll()
+                if ret is None:
+                    if st.get('status') == 'starting':
+                        st['status'] = 'running'
+                    continue
+
+                # Process died — capture stderr tail
+                try:
+                    err = (proc.stderr.read() or b'').decode('utf-8', errors='ignore')[-1500:]
+                except Exception:
+                    err = ''
+                st['ffmpeg_log'].append(f'[{datetime.now().isoformat()}] exit={ret}\n{err}')
+                st['ffmpeg_log'] = st['ffmpeg_log'][-10:]
+                st['last_error'] = f'ffmpeg exit {ret}'
+                st['status'] = 'crashed'
+
+                if st['restart_count'] >= MAX_RESTARTS:
+                    print(f'⛔ {ip} stream exceeded MAX_RESTARTS — giving up')
+                    stop_stream(ip, post_to_server=True)
+                    continue
+
+                # Backoff and restart
+                st['restart_count'] += 1
+                time.sleep(RESTART_BACKOFF_SEC)
+                print(f'🔄 Restarting stream {ip} (attempt {st["restart_count"]}/{MAX_RESTARTS})')
+                # Reuse same params
+                cmd = _build_ffmpeg_cmd(
+                    st['rtsp_url'],
+                    OVERLAY_DIR / f'static_{st["cell_id"]}.png',
+                    OVERLAY_DIR / f'score_{st["cell_id"]}.txt',
+                    st['yt_stream_key'],
+                    OVERLAY_DIR / 'banner_strip.png'
+                )
+                try:
+                    new_proc = subprocess.Popen(
+                        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                        start_new_session=(platform.system() != 'Windows')
+                    )
+                    st['proc'] = new_proc
+                    st['status'] = 'starting'
+                except Exception as e:
+                    st['last_error'] = f'restart spawn: {e}'
+
+        except Exception as e:
+            agent_status['errors'].append(f'watchdog: {e}')
+        time.sleep(1)
 
 
 # ============================================================
@@ -288,6 +1033,10 @@ def scan_loop():
                             'found_at': datetime.now().isoformat()
                         }
                         print(f'✅ Found scoreboard: {ip}')
+                        # Probe camera RTSP in background (don't block scan loop)
+                        threading.Thread(
+                            target=ensure_camera_for, args=(ip,), daemon=True
+                        ).start()
                 agent_status['devices_found'] = len(get_active_devices())
                 last_network_scan = now
             except Exception as e:
@@ -302,6 +1051,15 @@ def scan_loop():
                     dev['last_score'] = scores
                     dev['last_update'] = datetime.now().isoformat()
                     dev['status'] = 'connected'
+
+                    # Try auto-mapping on every scan when scoreboard players change.
+                    # Cheap: cached tournament_matches + name normalize. Skips if already
+                    # mapped manually or already correctly auto-mapped.
+                    name_changed = (not prev
+                                    or prev.get('player1_name') != scores.get('player1_name')
+                                    or prev.get('player2_name') != scores.get('player2_name'))
+                    if name_changed:
+                        auto_map_by_names(ip, scores)
 
                     mapping = mappings.get(ip)
                     pushed = False
@@ -699,6 +1457,226 @@ def api_unmap():
     return jsonify({'ok': True})
 
 
+@app.route('/api/active_tournament', methods=['GET', 'POST'])
+def api_active_tournament():
+    """Get or set the tournament that auto-map should match against."""
+    global active_tournament_id
+    if request.method == 'POST':
+        data = request.json or {}
+        tid = (data.get('tournament_id') or '').strip() or None
+        active_tournament_id = tid
+        config['active_tournament_id'] = tid
+        save_config(config)
+        # Also clear stale auto-mappings from a previous tournament
+        for ip in list(mappings.keys()):
+            m = mappings[ip]
+            if m.get('auto') and m.get('tournament_id') != tid:
+                del mappings[ip]
+        # Pre-fetch matches so first auto-map doesn't pay the request cost
+        if tid:
+            _fetch_tournament_matches(tid, force=True)
+        return jsonify({
+            'ok': True,
+            'tournament_id': tid,
+            'tournament_name': tournament_matches_cache.get('tournament_name', ''),
+            'matches_count': len(tournament_matches_cache.get('matches', []))
+        })
+    return jsonify({
+        'tournament_id': active_tournament_id,
+        'tournament_name': tournament_matches_cache.get('tournament_name', ''),
+        'matches': tournament_matches_cache.get('matches', []),
+        'fetched_at': tournament_matches_cache.get('fetched_at')
+    })
+
+
+@app.route('/api/tournament_matches')
+def api_tournament_matches():
+    """Return cached matches for the active tournament (or refetch on demand)."""
+    force = request.args.get('refresh') in ('1', 'true', 'yes')
+    matches = _fetch_tournament_matches(active_tournament_id, force=force) if active_tournament_id else []
+    return jsonify({
+        'tournament_id': active_tournament_id,
+        'tournament_name': tournament_matches_cache.get('tournament_name', ''),
+        'matches': matches,
+        'fetched_at': tournament_matches_cache.get('fetched_at')
+    })
+
+
+@app.route('/api/automap', methods=['POST'])
+def api_automap():
+    """Force a one-shot auto-map sweep across all active devices."""
+    if not active_tournament_id:
+        return jsonify({'ok': False, 'error': 'Chưa chọn giải đấu (active_tournament_id)'}), 400
+    _fetch_tournament_matches(active_tournament_id, force=True)
+    mapped, unmapped = 0, 0
+    for ip, dev in get_active_devices().items():
+        scores = dev.get('last_score')
+        if not scores:
+            continue
+        if auto_map_by_names(ip, scores):
+            mapped += 1
+        elif ip not in mappings:
+            unmapped += 1
+    return jsonify({
+        'ok': True,
+        'mapped': mapped,
+        'unmapped': unmapped,
+        'total_active': len(get_active_devices())
+    })
+
+
+@app.route('/api/auto_map_toggle', methods=['POST'])
+def api_auto_map_toggle():
+    """Enable/disable auto-mapping persistence."""
+    enabled = bool((request.json or {}).get('enabled', True))
+    config['auto_map_enabled'] = enabled
+    save_config(config)
+    return jsonify({'ok': True, 'auto_map_enabled': enabled})
+
+
+@app.route('/api/cameras')
+def api_cameras_list():
+    """Return all known camera entries, joined with current device state."""
+    out = []
+    for ip in sorted(set(list(devices.keys()) + list(cameras_db.keys()))):
+        cam = cameras_db.get(ip, {})
+        dev = devices.get(ip, {})
+        out.append({
+            'ip': ip,
+            'rtsp_url': cam.get('rtsp_url'),
+            'source': cam.get('source'),  # 'discovered' | 'manual' | 'cleared' | None
+            'last_probe': cam.get('last_probe'),
+            'set_at': cam.get('set_at'),
+            'device_status': dev.get('status'),
+            'has_active_game': bool(dev.get('last_score'))
+        })
+    return jsonify(out)
+
+
+@app.route('/api/cameras/<ip>')
+def api_cameras_detail(ip):
+    """Return single camera entry incl. probe log for diagnostics."""
+    cam = cameras_db.get(ip)
+    if not cam:
+        return jsonify({'ip': ip, 'rtsp_url': None, 'probe_log': []})
+    return jsonify(cam)
+
+
+@app.route('/api/cameras/probe', methods=['POST'])
+def api_cameras_probe():
+    """Re-probe one IP or all known scoreboards."""
+    data = request.json or {}
+    ip = data.get('ip')
+    if ip:
+        cam = ensure_camera_for(ip, force_reprobe=True)
+        return jsonify({'ok': True, 'camera': cam})
+    # Probe-all
+    results = []
+    for sip in list(devices.keys()):
+        cam = ensure_camera_for(sip, force_reprobe=True)
+        results.append({'ip': sip, 'rtsp_url': cam.get('rtsp_url'), 'source': cam.get('source')})
+    return jsonify({'ok': True, 'results': results})
+
+
+@app.route('/api/cameras', methods=['POST'])
+def api_cameras_set():
+    """Manually set RTSP URL for an IP. Empty URL clears it."""
+    data = request.json or {}
+    ip = (data.get('ip') or '').strip()
+    rtsp_url = (data.get('rtsp_url') or '').strip()
+    if not ip:
+        return jsonify({'ok': False, 'error': 'Missing ip'}), 400
+    cam = set_camera_manual(ip, rtsp_url)
+    return jsonify({'ok': True, 'camera': cam})
+
+
+@app.route('/api/cameras/<ip>', methods=['DELETE'])
+def api_cameras_delete(ip):
+    """Delete a camera entry entirely."""
+    if ip in cameras_db:
+        del cameras_db[ip]
+        save_cameras()
+    return jsonify({'ok': True})
+
+
+@app.route('/api/live/status')
+def api_live_status():
+    """List all currently active streams."""
+    with live_lock:
+        out = [_stream_dict_safe(st) for st in live_streams.values()]
+    return jsonify({'streams': out, 'count': len(out)})
+
+
+@app.route('/api/live/start', methods=['POST'])
+def api_live_start():
+    ip = (request.json or {}).get('ip')
+    if not ip:
+        return jsonify({'ok': False, 'error': 'Missing ip'}), 400
+    return jsonify(start_stream(ip))
+
+
+@app.route('/api/live/stop', methods=['POST'])
+def api_live_stop():
+    ip = (request.json or {}).get('ip')
+    if not ip:
+        return jsonify({'ok': False, 'error': 'Missing ip'}), 400
+    return jsonify(stop_stream(ip))
+
+
+@app.route('/api/live/start_all', methods=['POST'])
+def api_live_start_all():
+    """Start streams for all eligible scoreboards (mapped + has RTSP)."""
+    started, skipped = [], []
+    for ip in list(get_active_devices().keys()):
+        if ip in live_streams:
+            skipped.append({'ip': ip, 'reason': 'already_running'})
+            continue
+        if ip not in mappings:
+            skipped.append({'ip': ip, 'reason': 'unmapped'})
+            continue
+        if not (cameras_db.get(ip) or {}).get('rtsp_url'):
+            skipped.append({'ip': ip, 'reason': 'no_rtsp'})
+            continue
+        res = start_stream(ip)
+        if res.get('ok'):
+            started.append(ip)
+        else:
+            skipped.append({'ip': ip, 'reason': res.get('error')})
+    return jsonify({'ok': True, 'started': started, 'skipped': skipped})
+
+
+@app.route('/api/live/stop_all', methods=['POST'])
+def api_live_stop_all():
+    ips = list(live_streams.keys())
+    for ip in ips:
+        stop_stream(ip)
+    return jsonify({'ok': True, 'stopped': ips})
+
+
+@app.route('/api/live_config/<tid>')
+def api_live_config_proxy(tid):
+    """Proxy for ileague.info live_config — useful for UI to read yt key state."""
+    try:
+        url = config.get('ileague_api', 'https://ileague.info/api.php')
+        r = requests.get(url, params={'action': 'live_config', 'id': tid}, timeout=8)
+        return (r.text, r.status_code, {'Content-Type': 'application/json'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/live_config/<tid>', methods=['POST'])
+def api_live_config_save(tid):
+    """Save livestream config to ileague.info."""
+    try:
+        url = config.get('ileague_api', 'https://ileague.info/api.php')
+        body = dict(request.json or {})
+        body['tournament_id'] = tid
+        r = requests.post(f'{url}?action=live_config_save', json=body, timeout=8)
+        return (r.text, r.status_code, {'Content-Type': 'application/json'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/scores')
 def api_scores():
     return jsonify(score_log[-50:])
@@ -755,7 +1733,7 @@ def run_tray():
         set_autostart(not current)
 
     def open_pro_page(icon, item):
-        webbrowser.open('https://ileague.info/h')
+        webbrowser.open('https://ileague.info/p')
 
     def pro_label():
         if pro_status['active'] is None:
@@ -813,17 +1791,24 @@ def run_tray():
 def main():
     background = '--background' in sys.argv
 
+    # Restore persistent state
+    load_cameras()
+
     print('=' * 50)
     print(f'  iLeague Hub Agent v{VERSION}')
     print(f'  Dashboard: http://localhost:5050')
     print(f'  CLB: {config.get("club_name", "(chưa setup)")}')
     print(f'  Email: {config.get("email", "(chưa setup)")}')
+    print(f'  Cameras: {len(cameras_db)} cached')
     print('=' * 50)
 
     # Start scan thread
     scan_thread = threading.Thread(target=scan_loop, daemon=True)
     scan_thread.start()
     print('🔍 Scanning network for scoreboards...')
+
+    # Start ffmpeg watchdog (handles score file refresh + crash recovery)
+    threading.Thread(target=watchdog_loop, daemon=True).start()
 
     # Start Pro status refresh loop (every 5 min). First check is immediate so
     # the tray/dashboard show the right state on first hover.
