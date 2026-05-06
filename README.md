@@ -1,7 +1,17 @@
 # iLeague Hub Agent
 
-Quét bảng điểm Hello/9Score/Arena trong WiFi LAN → đọc tỉ số real-time → push lên iLeague.
+Quét bảng điểm trong WiFi LAN → đọc tỉ số real-time → push lên iLeague.
 Tùy chọn: pull RTSP camera tại CLB → composite overlay tỉ số → livestream YouTube.
+
+## Bảng điểm được hỗ trợ
+
+| App | Trạng thái | Note |
+|---|---|---|
+| **Hello** | ✅ Full | Score + RTSP URL auto-extracted từ `playerInfo.linkCamera` trong data.json — zero config |
+| 9ScoreBoard | 🟡 Pending | Cần tablet thật / partner API spec để viết adapter (~2-3h effort) |
+| Arena | 🟡 Pending | Cần tablet thật / partner API spec để viết adapter (~2-3h effort) |
+
+Code hiện tại tích hợp HTTP API của Hello. Mở rộng sang 9Score/Arena dùng adapter pattern (chưa implement).
 
 ## Cài đặt
 
